@@ -4,6 +4,8 @@ import signal
 from collections import Counter
 
 STUCK_STATE = "TH_UNINT"
+# Kernel threads sit in uninterruptible waits all the time, so pid 0 is not a suspect.
+KERNEL_PID = 0
 MAX_SUSPECTS = 5
 EXCERPT_LEN = 160
 
@@ -25,14 +27,17 @@ def parse_report(path):
     if len(parts) < 2:
         raise NotPanicReport("not a panic report: no JSON body after the header line")
     header = _load_json(parts[0])
-    body = _load_json("".join(parts[1:]))
+    # Some reports append a plain-text "System Profile:" section after the JSON body.
+    body = _load_json("".join(parts[1:]), allow_trailing=True)
     if not isinstance(header, dict) or not isinstance(body, dict):
         raise NotPanicReport("not a panic report: unexpected JSON structure")
     return {"header": header, "body": body}
 
 
-def _load_json(text):
+def _load_json(text, allow_trailing=False):
     try:
+        if allow_trailing:
+            return json.JSONDecoder().raw_decode(text.lstrip())[0]
         return json.loads(text)
     except (ValueError, TypeError):
         raise NotPanicReport("not a panic report: JSON parsing failed") from None
@@ -74,7 +79,7 @@ def rank_suspects(body):
             pid = int(pid_key)
         except (TypeError, ValueError):
             continue
-        if not isinstance(proc, dict):
+        if pid == KERNEL_PID or not isinstance(proc, dict):
             continue
         threads = proc.get("threadById")
         if not isinstance(threads, dict):

@@ -38,6 +38,11 @@ def launchd_sigbus_body(threads=None):
                        "initproc exited -- exit reason namespace 2 subcode 0xa",
         "memoryStatus": {"memoryPressure": False},
         "processByPid": {
+            # Real reports show kernel_task with hundreds of uninterruptible threads.
+            "0": make_proc(0, "kernel_task", {
+                str(n): make_thread(n, ("TH_WAIT", "TH_UNINT"), (9, n))
+                for n in range(5000, 5600)
+            }),
             "1234": make_proc(1234, "pagefind_extended",
                               threads or launchd_sigbus_threads()),
             "99": make_proc(99, "mds_stalled", {
@@ -61,6 +66,11 @@ def watchdog_body():
             "0": make_proc(0, "kernel_task", {
                 "100": make_thread(100, ("TH_WAIT", "TH_UNINT"), (3, 4)),
                 "101": make_thread(101, ("TH_WAIT", "TH_UNINT"), (3, 4)),
+                "102": make_thread(102, ("TH_WAIT", "TH_UNINT"), (3, 4)),
+            }),
+            "88": make_proc(88, "fseventsd", {
+                "1": make_thread(1, ("TH_WAIT", "TH_UNINT"), (3, 4)),
+                "2": make_thread(2, ("TH_WAIT", "TH_UNINT"), (3, 4)),
             }),
         },
     }
@@ -91,10 +101,11 @@ def minimal_body():
     }
 
 
-def write_panic(path, header=None, body=None):
+def write_panic(path, header=None, body=None, trailer=""):
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(json.dumps(header or build_header()) + "\n")
         fh.write(json.dumps(body if body is not None else launchd_sigbus_body()))
+        fh.write(trailer)
 
 
 def write_text(path, text="this file is not a panic report"):

@@ -27,6 +27,18 @@ class FixtureTest(unittest.TestCase):
 
 
 class ParseTest(FixtureTest):
+    def test_trailing_system_profile_text_is_ignored(self):
+        target = self.path("trailer.panic")
+        fx.write_panic(target, trailer="\n\nSystem Profile:\nBoot Volume File System Type: apfs\n")
+        result = report.analyze(target)
+        self.assertEqual(result["class"], "launchd-exit")
+        self.assertEqual(result["suspects"][0]["procname"], "pagefind_extended")
+
+    def test_kernel_task_is_never_a_suspect(self):
+        result = report.analyze(self.write("k.panic"))
+        self.assertNotIn(0, [s["pid"] for s in result["suspects"]])
+        self.assertEqual(result["suspects"][0]["stuck"], 512)
+
     def test_parse_launchd_sigbus(self):
         path = self.write("a.panic")
         parsed = report.parse_report(path)
@@ -91,7 +103,7 @@ class RankTest(unittest.TestCase):
 
     def test_sort_desc(self):
         suspects, _ = report.rank_suspects(fx.watchdog_body())
-        self.assertEqual(suspects[0]["pid"], 0)
+        self.assertEqual(suspects[0]["pid"], 88)
         self.assertEqual(suspects[0]["stuck"], 2)
 
 
