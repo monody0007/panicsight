@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "panicsight"
+version = "0.1.0"
+description = "Classify macOS kernel panic reports and check file/vnode table headroom"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.10"
+
+[project.scripts]
+panicsight = "panicsight.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

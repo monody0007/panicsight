@@ -9,7 +9,49 @@ panicsight reads macOS panic reports and points at the likely cause:
 - **Post-mortem triage**: classify a `.panic` file (launchd SIGBUS, watchdog timeout, zone exhaustion) and rank the processes that were blocked in the filesystem when the machine went down.
 - **Live watch**: sample open files and free vnodes, and name the process behind a spike before the table runs out.
 
-Status: early development. Nothing to install yet.
+## Install
+
+Requires Python 3.10 or newer. No runtime dependencies, standard library only.
+
+```sh
+pipx install git+https://github.com/monody0007/panicsight
+```
+
+## Usage
+
+### `panicsight analyze FILE [--json]`
+
+Classify a panic report written by macOS to `/Library/Logs/DiagnosticReports/panic-full-*.panic`, rank the processes by uninterruptible (`TH_UNINT`) threads, and print a verdict plus hints.
+
+```text
+launchd-exit (SIGBUS); memory pressure: no; top suspect: pagefind_extended (pid 1234): 512 of 515 threads uninterruptible, 511 on one wait event; system-wide 515.
+
+    pid  process                  stuck threads top-wait
+   1234  pagefind_extended          512     515      511
+     99  mds_stalled                  3       3        3
+
+Hints:
+- SIGBUS in launchd usually means a failed page-in; check whether the file table or vnode table was exhausted (sysctl kern.num_files kern.maxfiles), and look at the top suspect.
+```
+
+`--json` prints a single machine-readable object instead (keys `class`, `signal`, `memory_pressure`, `system_uninterruptible`, `suspects`, `os_version`, `timestamp`, `excerpt`). A file that is not a panic report exits with code 2 and a one-line error.
+
+### `panicsight check [--json]`
+
+Reads `kern.num_files`, `kern.maxfiles`, `kern.maxfilesperproc`, `kern.num_vnodes`, `kern.maxvnodes` and `kern.free_vnodes`, and warns when the file table is at or above 50% of `kern.maxfiles` or free vnodes drop below 10% of `kern.maxvnodes`.
+
+```text
+$ panicsight check
+kern.num_files: 12650
+kern.maxfiles: 491520
+kern.maxfilesperproc: 245760
+kern.num_vnodes: 263168
+kern.maxvnodes: 263168
+kern.free_vnodes: 182237
+file table use: 2.6% of kern.maxfiles
+free vnodes: 69.2% of kern.maxvnodes
+status: OK
+```
 
 ## License
 
