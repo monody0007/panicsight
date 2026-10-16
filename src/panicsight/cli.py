@@ -64,7 +64,7 @@ def _cmd_analyze(as_json, path):
 def _cmd_check(as_json):
     code, text, evaluation = check_module.run_check()
     if code != 0:
-        print(text, file=sys.stderr)
+        print("error: %s" % text, file=sys.stderr)
         return code
     if as_json:
         print_json(evaluation)

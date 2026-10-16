@@ -13,13 +13,21 @@ _LAUNCHD_RE = re.compile(
     r"initproc exited -- exit reason namespace (\d+) subcode (0x[0-9a-fA-F]+)")
 
 
+# Absolute paths in a panicString can name users and projects; never echo them.
+_PATH_RE = re.compile(r"(?<![\w.])/[^\s:,;()\[\]\"']+")
+
+
+def redact_paths(text):
+    return _PATH_RE.sub("<path>", text)
+
+
 class NotPanicReport(ValueError):
     pass
 
 
 def parse_report(path):
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
             text = fh.read()
     except (OSError, UnicodeDecodeError) as exc:
         raise NotPanicReport("cannot read file (%s)" % exc.__class__.__name__) from exc
@@ -58,7 +66,7 @@ def classify(panic_string):
         return {"class": "watchdog-timeout", "signal": None,
                 "label": None, "excerpt": None}
     return {"class": "other", "signal": None, "label": None,
-            "excerpt": panic_string[:EXCERPT_LEN]}
+            "excerpt": redact_paths(panic_string)[:EXCERPT_LEN]}
 
 
 def _signal_name(number):
@@ -178,7 +186,7 @@ def render_verdict(result):
         head += "; top suspect: %s" % desc
     else:
         head += "; top suspect: none"
-    head += "; system-wide %d." % result["system_uninterruptible"]
+    head += "; uninterruptible threads outside the kernel: %d." % result["system_uninterruptible"]
     return head
 
 

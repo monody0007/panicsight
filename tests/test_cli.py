@@ -56,7 +56,7 @@ class AnalyzeCliTest(CliBase):
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
         self.assertTrue(out.startswith("watchdog-timeout"))
-        self.assertIn("system-wide 2.", out)
+        self.assertIn("outside the kernel: 2.", out)
         self.assertIn("kern.num_vnodes", out)
 
     def test_not_panic_report_exits_two(self):

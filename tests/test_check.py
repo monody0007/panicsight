@@ -79,6 +79,21 @@ class RunCheckTest(unittest.TestCase):
         self.assertIn(evaluation["status"], ("OK", "WARN"))
 
 
+class NonMacTest(unittest.TestCase):
+    def test_non_macos_returns_message_and_skips_sysctl(self):
+        calls = []
+        original = ck.platform.system
+        ck.platform.system = lambda: "Linux"
+        try:
+            code, message, evaluation = ck.run_check(lambda name: calls.append(name))
+        finally:
+            ck.platform.system = original
+        self.assertEqual(code, 2)
+        self.assertIn("requires macOS", message)
+        self.assertIsNone(evaluation)
+        self.assertEqual(calls, [])
+
+
 class RenderTest(unittest.TestCase):
     def test_text_marks_warning(self):
         result = ck.evaluate(dict(LOW, **{"kern.num_files": 13000,

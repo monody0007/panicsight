@@ -6,8 +6,8 @@ Agent workloads open files, spawn processes and watch directories at a scale tha
 
 panicsight reads macOS panic reports and points at the likely cause:
 
-- **Post-mortem triage**: classify a `.panic` file (launchd SIGBUS, watchdog timeout, zone exhaustion) and rank the processes that were blocked in the filesystem when the machine went down.
-- **Live watch**: sample open files and free vnodes, and name the process behind a spike before the table runs out.
+- **Post-mortem triage**: classify a `.panic` file (launchd exit with its signal, watchdog timeout, other) and rank the processes that were blocked in the filesystem when the machine went down.
+- **Resource check**: `panicsight check` reports how full the file table and vnode table are right now, so you can watch them during large builds. A continuous watch mode that names the process behind a spike is planned.
 
 ## Install
 
@@ -24,7 +24,7 @@ pipx install git+https://github.com/monody0007/panicsight
 Classify a panic report written by macOS to `/Library/Logs/DiagnosticReports/panic-full-*.panic`, rank the processes by uninterruptible (`TH_UNINT`) threads, and print a verdict plus hints.
 
 ```text
-launchd-exit (SIGBUS); memory pressure: no; top suspect: pagefind_extended (pid 1234): 512 of 515 threads uninterruptible, 511 on one wait event; system-wide 515.
+launchd-exit (SIGBUS); memory pressure: no; top suspect: pagefind_extended (pid 1234): 512 of 515 threads uninterruptible, 511 on one wait event; uninterruptible threads outside the kernel: 515.
 
     pid  process                  stuck threads top-wait
    1234  pagefind_extended          512     515      511

@@ -82,6 +82,15 @@ class ClassifyTest(FixtureTest):
         result = report.classify("watchdog timeout for some other reason")
         self.assertEqual(result["class"], "other")
 
+    def test_other_excerpt_redacts_paths(self):
+        text = ("panic(cpu 1 caller 0x1): Kernel trap at /Users/alice/secret/project/file.c:42 "
+                "while mapping /private/var/folders/xy/abc and @/AppleInternal/Library/x.c")
+        result = report.classify(text)
+        self.assertNotIn("alice", result["excerpt"])
+        self.assertNotIn("/private", result["excerpt"])
+        self.assertNotIn("AppleInternal", result["excerpt"])
+        self.assertIn("<path>:42", result["excerpt"])
+
     def test_other_excerpt(self):
         text = "x" * 200
         result = report.classify(text)
@@ -125,7 +134,7 @@ class AnalyzeTest(FixtureTest):
         result = report.analyze(path)
         self.assertEqual(result["class"], "watchdog-timeout")
         self.assertTrue(result["memory_pressure"])
-        self.assertNotEqual(report.HINTS.get("watchdog-timeout"), None)
+        self.assertIn("kern.num_vnodes", report.render_text(result))
 
     def test_missing_processbypid(self):
         path = self.write("m.panic", body=fx.minimal_body())

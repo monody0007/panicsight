@@ -102,8 +102,8 @@ def render_text(evaluation):
 
 
 def run_check(runner=None):
-    evaluation = evaluate(collect_values(runner or default_runner()))
     if platform.system() != "Darwin":
-        return 2, None, ("panicsight check requires macOS: sysctl kern.* names "
-                         "are unavailable on this platform")
+        return 2, ("panicsight check requires macOS: sysctl kern.* names "
+                   "are unavailable on this platform"), None
+    evaluation = evaluate(collect_values(runner or default_runner()))
     return 0, render_text(evaluation), evaluation
