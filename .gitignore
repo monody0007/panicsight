@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+# never commit real panic reports or logs; use redacted fixtures only
+*.panic
+*.ips
