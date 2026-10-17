@@ -11,7 +11,7 @@ SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
-from panicsight import cli  # noqa: E402
+from panicsight import __version__, cli  # noqa: E402
 
 import make_fixtures as fx  # noqa: E402
 
@@ -32,6 +32,18 @@ class CliBase(unittest.TestCase):
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             code = cli.main(argv)
         return code, stdout.getvalue(), stderr.getvalue()
+
+
+class VersionCliTest(CliBase):
+    def test_version_without_subcommand(self):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as exc:
+                cli.main(["--version"])
+        self.assertEqual(exc.exception.code, 0)
+        self.assertEqual(stdout.getvalue(), "panicsight %s\n" % __version__)
+        self.assertEqual(__version__, "0.2.0")
+        self.assertEqual(stderr.getvalue(), "")
 
 
 class AnalyzeCliTest(CliBase):

@@ -2,6 +2,7 @@ import argparse
 import json
 import sys
 
+from panicsight import __version__
 from panicsight import check as check_module
 from panicsight import report as report_module
 from panicsight import watch as watch_module
@@ -19,6 +20,7 @@ def build_parser():
         prog="panicsight",
         description="Analyze macOS kernel panic reports and check file/vnode table headroom.",
     )
+    parser.add_argument("--version", action="version", version="panicsight " + __version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
     analyze = subparsers.add_parser(
         "analyze", help="classify a .panic file and rank suspect processes")
@@ -41,7 +43,7 @@ def build_parser():
     watch.add_argument("--max-bytes", type=_positive_int, default=5_000_000, metavar="N",
                        help="rotate the log above N bytes, keeping PATH.1 (default 5000000)")
     watch.add_argument("--count", type=_positive_int, metavar="N",
-                       help="stop after N samples/records (default forever)")
+                       help="stop after N samples, including failed writes (default forever)")
     return parser
 
 
@@ -75,6 +77,9 @@ def main(argv=None):
                 baseline_interval=args.baseline_interval,
                 elevated_interval=args.elevated_interval, log=args.log,
                 top=args.top, max_bytes=args.max_bytes, count=args.count)
+        except watch_module.LogLockedError as exc:
+            print("error: %s" % exc, file=sys.stderr)
+            return 2
         except OSError as exc:
             print("error: cannot write watch output (%s)" % exc.__class__.__name__,
                   file=sys.stderr)

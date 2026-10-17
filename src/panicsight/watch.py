@@ -47,13 +47,22 @@ def enumerate_fds():
         size = lib.proc_pidinfo(pid, PROC_PIDLISTFDS, 0, None, 0)
         if size <= 0:
             continue
+        buffer = ctypes.create_string_buffer(size)
+        copied = lib.proc_pidinfo(pid, PROC_PIDLISTFDS, 0, buffer, size)
+        if copied == size:
+            # Fds may have opened since sizing; retry once with more room.
+            size *= 2
+            buffer = ctypes.create_string_buffer(size)
+            copied = lib.proc_pidinfo(pid, PROC_PIDLISTFDS, 0, buffer, size)
+        if copied <= 0:
+            continue
         name = ctypes.create_string_buffer(1024)
         if lib.proc_name(pid, name, len(name)) <= 0:
             continue
         basename = os.path.basename(os.fsdecode(name.value))
         if basename:
             holders.append({"pid": pid, "name": basename,
-                            "fds": size // ctypes.sizeof(ProcFdInfo)})
+                            "fds": copied // ctypes.sizeof(ProcFdInfo)})
     return holders
 
 
@@ -138,6 +147,10 @@ def render_text(record):
         holders, " warnings=" + "; ".join(record["warnings"]) if record["warnings"] else ""))
 
 
+class LogLockedError(OSError):
+    """Another writer holds the lock for this log path."""
+
+
 class RecordWriter:
     """Append full lines, flushing each one, with a single rotating backup."""
 
@@ -146,32 +159,62 @@ class RecordWriter:
         self.max_bytes = max_bytes
         self.stream = stream if stream is not None else sys.stdout
         self.file = None
+        self.lock_file = None
 
     def __enter__(self):
         if self.path is not None:
+            import fcntl
+
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.file = self.path.open("a", encoding="utf-8")
-            self._rotate()
+            try:
+                self.lock_file = Path(str(self.path) + ".lock").open("a")
+                try:
+                    fcntl.flock(self.lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise LogLockedError(
+                        "another panicsight watch is already writing %s" % self.path) from exc
+                self.file = self.path.open("a", encoding="utf-8")
+                self._rotate()
+            except OSError:
+                self.__exit__(*sys.exc_info())
+                raise
         return self
 
     def _rotate(self):
         if self.file.tell() > self.max_bytes:
-            self.file.close()
+            previous, self.file = self.file, None
+            previous.close()
             self.path.replace(Path(str(self.path) + ".1"))
             self.file = self.path.open("a", encoding="utf-8")
 
     def write(self, record):
-        target = self.file if self.file is not None else self.stream
+        if self.path is not None and self.file is None:
+            self.file = self.path.open("a", encoding="utf-8")
+        target = self.file if self.path is not None else self.stream
         line = (json.dumps(record, separators=(",", ":"), ensure_ascii=True)
                 if self.path is not None else render_text(record)) + "\n"
-        target.write(line)
-        target.flush()
-        if self.file is not None:
-            self._rotate()
+        try:
+            target.write(line)
+            target.flush()
+            if self.file is not None:
+                self._rotate()
+        except OSError:
+            # Reopen on the next sample, including after a failed rotation.
+            previous, self.file = self.file, None
+            if previous is not None:
+                try:
+                    previous.close()
+                except OSError:
+                    pass
+            raise
 
     def __exit__(self, exc_type, exc, traceback):
-        if self.file is not None:
-            self.file.close()
+        try:
+            if self.file is not None:
+                self.file.close()
+        finally:
+            if self.lock_file is not None:
+                self.lock_file.close()
 
 
 def run_watch(baseline_interval=900, elevated_interval=30, log=None, top=5,
@@ -182,6 +225,10 @@ def run_watch(baseline_interval=900, elevated_interval=30, log=None, top=5,
     Clock, wait, sysctls and fd enumeration can all be replaced in tests.
     Signal handlers only set an event, so an in-flight sample/write can finish.
     """
+    if runner is None and platform.system() != "Darwin":
+        print("error: panicsight watch requires macOS: sysctl kern.* names "
+              "are unavailable on this platform", file=sys.stderr)
+        return 2
     runner = runner if runner is not None else check.default_runner()
     fd_enumerator = fd_enumerator if fd_enumerator is not None else enumerate_fds
     now = now if now is not None else lambda: datetime.now().astimezone()
@@ -193,7 +240,8 @@ def run_watch(baseline_interval=900, elevated_interval=30, log=None, top=5,
         stop_event.set()
 
     state = TierState()
-    emitted = 0
+    sampled = 0
+    write_failed = False
     try:
         for signum in (signal.SIGTERM, signal.SIGINT):
             handlers[signum] = signal.signal(signum, stop)
@@ -204,9 +252,19 @@ def run_watch(baseline_interval=900, elevated_interval=30, log=None, top=5,
                     events, triggers = state.update(sample)
                     interval = (elevated_interval if state.mode == "elevated"
                                 else baseline_interval)
-                    writer.write(make_record(sample, state.mode, interval, events, triggers))
-                    emitted += 1
-                    if count is not None and emitted >= count:
+                    try:
+                        writer.write(make_record(sample, state.mode, interval, events, triggers))
+                    except OSError as exc:
+                        if not write_failed:
+                            print("error: log write failed (%s); retrying with next sample"
+                                  % exc.__class__.__name__, file=sys.stderr)
+                        write_failed = True
+                    else:
+                        if write_failed:
+                            print("log write recovered", file=sys.stderr)
+                        write_failed = False
+                    sampled += 1
+                    if count is not None and sampled >= count:
                         break
                     if not stop_event.is_set():
                         wait(interval)

@@ -31,6 +31,7 @@ KEYS = {"schema", "ts", "mode", "next_interval_s", "events", "triggers", "num_fi
 def fake_default_sysctls(monkeypatch):
     # Unit tests, including CLI defaults, cannot invoke a real sysctl subprocess.
     monkeypatch.setattr(check, "default_runner", lambda: LOW.get)
+    monkeypatch.setattr(watch.platform, "system", lambda: "Darwin")
 
 
 class FakeClock:
@@ -305,6 +306,48 @@ def test_default_event_wait_and_default_enumerator(monkeypatch):
     assert len(out.getvalue().splitlines()) == 1
 
 
+def test_write_failure_streaks_keep_sampling_and_recover(monkeypatch, capsys):
+    clock = FakeClock()
+    sampling = Sampling([value(5), value(20), LOW, LOW, LOW, LOW, LOW])
+    writer = Mock()
+    writer.__enter__ = Mock(return_value=writer)
+    writer.__exit__ = Mock(return_value=False)
+    writer.write.side_effect = [OSError("full"), OSError("full"), None, None,
+                                OSError("offline"), OSError("offline"), None]
+    monkeypatch.setattr(watch, "RecordWriter", Mock(return_value=writer))
+    assert watch.run_watch(count=7, runner=sampling.runner, fd_enumerator=sampling.fds,
+                           wait=clock.wait, now=clock.now) == 0
+    rows = [call.args[0] for call in writer.write.call_args_list]
+    assert [row["top_fd"][0]["pid"] for row in rows] == list(range(10, 17))
+    assert sampling.calls == list(check.SYSCTL_NAMES) * 7
+    assert clock.waits == [900] + [30] * 5
+    assert [row["mode"] for row in rows] == ["baseline"] + ["elevated"] * 6
+    assert [row["ts"] for row in rows] == [
+        (datetime(2026, 10, 16, 12, tzinfo=timezone(timedelta(hours=-7)))
+         + timedelta(seconds=s)).isoformat(timespec="seconds")
+        for s in (0, 900, 930, 960, 990, 1020, 1050)]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        "error: log write failed (OSError); retrying with next sample",
+        "log write recovered",
+        "error: log write failed (OSError); retrying with next sample",
+        "log write recovered"]
+    writer.__exit__.assert_called_once_with(None, None, None)
+
+
+def test_count_includes_failed_writes(monkeypatch, capsys):
+    clock = FakeClock()
+    target = Mock()
+    target.write.side_effect = OSError("full")
+    assert watch.run_watch(count=3, runner=LOW.get, fd_enumerator=lambda: [],
+                           stream=target, wait=clock.wait) == 0
+    assert target.write.call_count == 3
+    assert clock.waits == [900, 900]
+    assert capsys.readouterr().err == (
+        "error: log write failed (OSError); retrying with next sample\n")
+
+
 def record():
     sample = watch.collect_sample(LOW.get, lambda: [{"pid": 1, "name": "worker\nname", "fds": 3}],
                                   5, FakeClock().now)
@@ -360,7 +403,8 @@ def test_rotation_after_limit_replaces_only_backup(tmp_path):
         writer.write({"n": 3})
         writer.write({"n": 4})
         assert backup.read_text() == '{"n":3}\n{"n":4}\n'
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["log.jsonl", "log.jsonl.1"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "log.jsonl", "log.jsonl.1", "log.jsonl.lock"]
 
 
 def test_append_existing_and_rotate_oversized_on_open(tmp_path):
@@ -372,6 +416,100 @@ def test_append_existing_and_rotate_oversized_on_open(tmp_path):
     with watch.RecordWriter(path, max_bytes=10):
         assert path.read_text() == ""
         assert path.with_name(path.name + ".1").read_text() == '{"old":1}\n{"new":2}\n'
+
+
+def test_rotation_failure_reopens_and_recovers_next_record(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "rotate.jsonl"
+    replace = Path.replace
+    attempts = []
+
+    def fail_twice(source, target):
+        attempts.append(source)
+        if len(attempts) <= 2:
+            raise PermissionError("rotation unavailable")
+        return replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", fail_twice)
+    assert watch.run_watch(log=path, max_bytes=1, count=3, runner=LOW.get,
+                           fd_enumerator=lambda: [], wait=lambda seconds: None) == 0
+    assert attempts == [path] * 3
+    assert path.read_text() == ""
+    rows = [json.loads(line) for line in Path(str(path) + ".1").read_text().splitlines()]
+    assert len(rows) == 3
+    assert all(set(row) == KEYS for row in rows)
+    assert capsys.readouterr().err.splitlines() == [
+        "error: log write failed (PermissionError); retrying with next sample",
+        "log write recovered"]
+
+
+@pytest.mark.parametrize("phase", ["write", "flush", "reopen"])
+def test_writer_recovers_file_errors_without_losing_lock(tmp_path, monkeypatch, phase):
+    path = tmp_path / "retry.jsonl"
+    with watch.RecordWriter(path) as writer:
+        original = writer.file
+        with monkeypatch.context() as patch:
+            if phase == "reopen":
+                writer.max_bytes = 1
+                path_open = Path.open
+
+                def fail_reopen(target, *args, **kwargs):
+                    if target == path:
+                        raise OSError("temporarily unavailable")
+                    return path_open(target, *args, **kwargs)
+
+                patch.setattr(Path, "open", fail_reopen)
+            else:
+                writer.file = Mock(wraps=original)
+                getattr(writer.file, phase).side_effect = OSError("temporarily unavailable")
+            with pytest.raises(OSError, match="temporarily unavailable"):
+                writer.write({"n": 1})
+        assert original.closed
+        assert writer.file is None
+        with pytest.raises(watch.LogLockedError, match="another panicsight watch"):
+            with watch.RecordWriter(path):
+                pytest.fail("second writer acquired the log during a write failure")
+        writer.max_bytes = 5_000_000
+        writer.write({"n": 2})
+    assert json.loads(path.read_text().splitlines()[-1]) == {"n": 2}
+
+
+def test_log_lock_blocks_second_writer_before_and_after_rotation(tmp_path, capsys):
+    path = tmp_path / "locked.jsonl"
+    backup = Path(str(path) + ".1")
+    with watch.RecordWriter(path, max_bytes=1) as writer:
+        lock_inode = Path(str(path) + ".lock").stat().st_ino
+        for rotated in (False, True):
+            if rotated:
+                writer.write({"n": 1})
+                assert backup.read_text() == '{"n":1}\n'
+            assert cli.main(["watch", "--log", str(path), "--count", "1"]) == 2
+            assert capsys.readouterr().err == (
+                "error: another panicsight watch is already writing %s\n" % path)
+            assert path.read_text() == ""
+            assert Path(str(path) + ".lock").stat().st_ino == lock_inode
+    # Keep the lock file on disk: unlinking it could let writers lock different inodes.
+    with watch.RecordWriter(path) as writer:
+        writer.write({"n": 2})
+    assert path.read_text() == '{"n":2}\n'
+    assert backup.read_text() == '{"n":1}\n'
+
+
+def test_startup_open_failure_releases_lock(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "blocked.jsonl"
+    path_open = Path.open
+
+    def fail_log_open(target, *args, **kwargs):
+        if target == path:
+            raise PermissionError("blocked")
+        return path_open(target, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", fail_log_open)
+        assert cli.main(["watch", "--log", str(path), "--count", "1"]) == 2
+    assert capsys.readouterr().err == "error: cannot write watch output (PermissionError)\n"
+    with watch.RecordWriter(path) as writer:
+        writer.write({"n": 1})
+    assert path.read_text() == '{"n":1}\n'
 
 
 def test_non_macos_enumerator_returns_empty_without_loading(monkeypatch):
@@ -389,7 +527,10 @@ def test_unavailable_libproc_returns_empty(monkeypatch, error):
     assert watch.enumerate_fds() == []
 
 
-def fake_libproc(monkeypatch, pids, sizes=None, names=None, needed=None, found=None):
+def fake_libproc(monkeypatch, pids, sizes=None, names=None, needed=None, found=None,
+                 copied=None):
+    copies = {pid: iter(values) for pid, values in (copied or {}).items()}
+
     def listpids(buffer, byte_size):
         if buffer is None:
             assert byte_size == 0
@@ -399,8 +540,17 @@ def fake_libproc(monkeypatch, pids, sizes=None, names=None, needed=None, found=N
         return len(pids) if found is None else found
 
     def pidinfo(pid, flavor, arg, buffer, byte_size):
-        assert (flavor, arg, buffer, byte_size) == (1, 0, None, 0)
-        return sizes[pid]
+        assert (flavor, arg) == (1, 0)
+        if buffer is None:
+            assert byte_size == 0
+            return sizes[pid]
+        assert ctypes.sizeof(buffer) == byte_size
+        returned = next(copies[pid]) if pid in copies else sizes[pid] - 8
+        if returned > 0:
+            assert returned <= byte_size
+            assert returned % 8 == 0
+            ctypes.memset(buffer, 0, returned)
+        return returned
 
     def name(pid, buffer, byte_size):
         val = names[pid]
@@ -418,13 +568,35 @@ def fake_libproc(monkeypatch, pids, sizes=None, names=None, needed=None, found=N
 
 def test_ctypes_counts_skip_inaccessible_and_missing_names(monkeypatch):
     lib = fake_libproc(monkeypatch, [0, -1, 10, 11, 12, 13, 14],
-                      {10: 0, 11: 24, 12: 32, 13: -1, 14: 8},
-                      {11: b"", 12: b"/some/worker", 14: b"/"})
+                      {10: 0, 11: 24, 12: 80, 13: -1, 14: 16},
+                      {11: b"", 12: b"/some/worker", 14: b"/"},
+                      copied={11: [16], 12: [32], 14: [8]})
     assert ctypes.sizeof(watch.ProcFdInfo) == 8
     assert watch.enumerate_fds() == [{"pid": 12, "name": "worker", "fds": 4}]
-    assert lib.proc_pidinfo.call_count == 5
+    assert lib.proc_pidinfo.call_count == 8
     assert lib.proc_name.call_count == 3
     assert lib.proc_pidinfo.argtypes[2] is ctypes.c_uint64
+
+
+@pytest.mark.parametrize("copied,expected,buffer_sizes", [
+    ([24], 3, [80]),
+    ([80, 104], 13, [80, 160]),
+    ([80, 160], 20, [80, 160]),
+    ([0], None, [80]),
+    ([-1], None, [80]),
+    ([80, 0], None, [80, 160]),
+    ([80, -1], None, [80, 160]),
+])
+def test_ctypes_uses_copied_bytes_and_retries_full_buffer_once(
+        monkeypatch, copied, expected, buffer_sizes):
+    lib = fake_libproc(monkeypatch, [42], {42: 80}, {42: b"worker"},
+                      copied={42: copied})
+    assert watch.enumerate_fds() == (
+        [] if expected is None else [{"pid": 42, "name": "worker", "fds": expected}])
+    calls = lib.proc_pidinfo.call_args_list
+    assert calls[0].args == (42, 1, 0, None, 0)
+    assert [call.args[4] for call in calls[1:]] == buffer_sizes
+    assert all(call.args[3] is not None for call in calls[1:])
 
 
 @pytest.mark.parametrize("needed,found", [(0, None), (-1, None), (1, -1), (1, 100)])
@@ -434,12 +606,63 @@ def test_pid_listing_failure_and_bounds(monkeypatch, needed, found):
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="real libproc requires macOS")
-def test_real_darwin_libproc_smoke():
-    holders = watch.enumerate_fds()
-    assert len(holders) >= 1
-    current = next(item for item in holders if item["pid"] == os.getpid())
-    assert current["fds"] >= 3
-    assert current["name"]
+def test_real_darwin_libproc_smoke(tmp_path):
+    pid = os.getpid()
+
+    def current():
+        return next(item for item in watch.enumerate_fds() if item["pid"] == pid)
+
+    # Keep lsof's output fd open in both measurements, avoiding transient capture pipes.
+    with (tmp_path / "lsof.txt").open("w+") as output:
+        def compare_lsof(count):
+            if Path("/usr/sbin/lsof").exists():
+                output.seek(0)
+                output.truncate()
+                subprocess.run(["/usr/sbin/lsof", "-Fn", "-p", str(pid)],
+                               stdout=output, check=True, timeout=10)
+                output.seek(0)
+                numbered = [line for line in output.read().splitlines()
+                            if line.startswith("f") and line[1:].isdigit()]
+                assert len(numbered) == count
+
+        baseline = current()
+        assert baseline["fds"] >= 3
+        assert baseline["name"]
+        compare_lsof(baseline["fds"])
+        extra = []
+        try:
+            for _ in range(37):
+                extra.append(os.open(os.devnull, os.O_RDONLY))
+            raised = current()
+            assert raised["fds"] - baseline["fds"] == 37
+            compare_lsof(raised["fds"])
+        finally:
+            for fd in extra:
+                os.close(fd)
+        assert current()["fds"] == baseline["fds"]
+
+
+def test_watch_non_macos_exits_two_before_probes_or_log_open(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(watch.platform, "system", lambda: "Linux")
+    probe = Mock(side_effect=AssertionError("must not probe"))
+    monkeypatch.setattr(check, "default_runner", probe)
+    monkeypatch.setattr(watch, "enumerate_fds", probe)
+    path = tmp_path / "absent" / "watch.jsonl"
+    assert cli.main(["watch", "--log", str(path), "--count", "1"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ("error: panicsight watch requires macOS: sysctl kern.* names "
+                            "are unavailable on this platform\n")
+    probe.assert_not_called()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_watch_injected_runner_works_on_non_macos(monkeypatch):
+    monkeypatch.setattr(watch.platform, "system", lambda: "Linux")
+    output = io.StringIO()
+    assert watch.run_watch(runner=LOW.get, fd_enumerator=lambda: [], count=1,
+                           stream=output) == 0
+    assert "baseline OK" in output.getvalue()
 
 
 def test_watch_cli_defaults_and_options(monkeypatch):

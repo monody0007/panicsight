@@ -22,6 +22,8 @@ pipx install git+https://github.com/monody0007/panicsight
 
 ## Usage
 
+`panicsight --version` prints the installed version, for example `panicsight 0.2.0`.
+
 ### `panicsight analyze FILE [--json]`
 
 Classify a panic report written by macOS to `/Library/Logs/DiagnosticReports/panic-full-*.panic`, rank the processes by uninterruptible (`TH_UNINT`) threads, and print a verdict plus hints.
@@ -60,7 +62,7 @@ status: OK
 
 Continuously sample the same six sysctls as `check`, together with per-process
 fd counts from macOS libproc. The first sample is immediate, and every sample
-produces exactly one record. Without `--log`, each record is one human-readable
+attempts one record. Without `--log`, each record is one human-readable
 stdout line. With `--log`, append schema v1 JSONL, creating parent directories:
 
 ```sh
@@ -76,7 +78,7 @@ panicsight watch --count 3 --baseline-interval 1 --elevated-interval 1
 | `--log PATH` | stdout | Append JSONL instead of human-readable text. |
 | `--top N` | `5` | Positive number of top fd holders to record. |
 | `--max-bytes N` | `5000000` | Rotate when the log exceeds N bytes, replacing `PATH.1`; retain exactly one backup. |
-| `--count N` | forever | Stop after N samples/records. |
+| `--count N` | forever | Stop after N samples, including failed writes. |
 
 Watch starts in **baseline** mode (15 minutes). A sample switches it to
 **elevated** mode (30 seconds) if any of these conditions fires:
@@ -105,21 +107,37 @@ seconds precision. SIGTERM and Ctrl-C interrupt even a 900-second wait and exit 
 Example JSONL line (illustrative values):
 
 ```json
-{"schema":1,"ts":"2026-10-16T12:00:00-07:00","mode":"elevated","next_interval_s":30,"events":["escalate"],"triggers":["file_table_pct>=20"],"num_files":100000,"maxfiles":491520,"maxfilesperproc":245760,"num_vnodes":263168,"maxvnodes":263168,"free_vnodes":180000,"file_table_pct":20.345052083333336,"free_vnode_pct":68.39737354085604,"status":"OK","warnings":[],"thresholds":{"file_table_warn_pct":50.0,"free_vnode_warn_pct":10.0,"file_table_elevated_pct":20.0,"free_vnode_elevated_pct":30.0,"growth_pct_points":5.0},"top_fd":[{"pid":1234,"name":"Python","fds":4116}]}
+{"schema":1,"ts":"2026-10-16T12:00:00-07:00","mode":"elevated","next_interval_s":30,"events":["escalate"],"triggers":["file_table_pct>=20"],"num_files":100000,"maxfiles":491520,"maxfilesperproc":245760,"num_vnodes":263168,"maxvnodes":263168,"free_vnodes":180000,"file_table_pct":20.345052083333336,"free_vnode_pct":68.39737354085604,"status":"OK","warnings":[],"thresholds":{"file_table_warn_pct":50.0,"free_vnode_warn_pct":10.0,"file_table_elevated_pct":20.0,"free_vnode_elevated_pct":30.0,"growth_pct_points":5.0},"top_fd":[{"pid":1234,"name":"Python","fds":3003}]}
 ```
 
 Only pid, process name (basename) and fd count are recorded for each holder;
-paths, argv and cwd are never collected. Counts use libproc's buffer-size
-estimate (`proc_pidinfo(..., PROC_PIDLISTFDS, ..., NULL, 0) / 8`) and can exceed
-the number of open descriptors. In a local discrimination test, a Python child
-holding 3000 `/dev/null` fds ranked first in all three samples, with an estimate
-of 4116. Inaccessible or exited processes are silently skipped. Missing sysctls
-become `null`; on platforms without libproc, `top_fd` is empty.
+paths, argv and cwd are never collected. Counts come from the actual fd list
+copied by `proc_pidinfo(..., PROC_PIDLISTFDS, ...)`: returned bytes divided by
+the 8-byte entry size. The initial NULL-buffer call only sizes the allocation;
+if the copied list fills it, watch retries once with a buffer twice as large.
+In a local discrimination test, a Python child holding 3000 `/dev/null` fds
+ranked first in all three samples with **3003** open descriptors (including its
+three standard descriptors), exactly matching `lsof`'s fd-numbered entries.
+Inaccessible or exited processes are silently skipped. Missing sysctls become
+`null`; unavailable libproc yields an empty `top_fd`. Watch requires macOS;
+on other platforms it exits 2 with a one-line error.
 
 Each complete line is written in one `write` followed by `flush`. Readers should
-ignore a trailing incomplete line and reopen the log after rotation. Rotation
-happens after a complete record (or on opening an already oversized log), so a
-file can exceed the limit by one record and the new active log can be empty.
+ignore malformed or incomplete lines left by write errors and reopen the log
+after rotation. Rotation happens after a complete record (or on opening an
+already oversized log), so a file can exceed the limit by one record and the
+new active log can be empty.
+
+Only one watch may write a given log path: an exclusive nonblocking `flock` on
+`PATH.lock` lasts through rotation. A second writer exits 2 with
+`error: another panicsight watch is already writing PATH`. The lock file remains
+on disk after exit; its presence alone does not mean a writer is running.
+
+Failure to open the log at startup exits 2. Later write or rotation failures
+keep sampling at the selected interval and retry with the next sample; failed
+records may be dropped and are not replayed. Stderr reports the first failure
+of each streak once, then prints `log write recovered` on the next successful
+write. `--count` counts sample attempts even during a write outage.
 
 This mode is meant to run under **launchd with `KeepAlive`** for continuous
 collection and automatic restarts. Use absolute executable and log paths in
@@ -130,10 +148,10 @@ write through a kernel panic depends on filesystem caching.
 
 Measured on macOS 27.0.1 arm64, Python 3.14.7 (2026-10-16):
 `/usr/bin/time -l` over `watch --count 3 --baseline-interval 1 --elevated-interval 1`
-with JSONL output took **2.10 s wall, 0.05 s user CPU and 0.03 s system CPU**,
-including startup and two 1-second waits (about 33 ms non-wait wall time and
+with JSONL output took **2.12 s wall, 0.04 s user CPU and 0.04 s system CPU**,
+including startup and two 1-second waits (about 40 ms non-wait wall time and
 27 ms CPU per record when amortized). Separately timing the three collection
-calls gave **14.83 ms wall and 13.54 ms CPU per sample on average**, including
+calls gave **16.90 ms wall and 14.79 ms CPU per sample on average**, including
 sysctl child CPU; collection excludes startup, output and waits. These are local
 measurements, not a performance guarantee.
 
