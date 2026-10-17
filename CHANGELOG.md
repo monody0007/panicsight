@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-10-17)
 
 - `panicsight watch`: sample file/vnode headroom and the top per-process fd holders with a 900-second baseline and a 30-second elevated tier, using standard-library ctypes and macOS libproc.
 - Escalate at >= 20% file table use, <= 30% free vnodes, WARN status, or >= 5 percentage points of file-table growth since the previous sample. De-escalate after 10 consecutive untriggered samples; share all thresholds with `check`.
