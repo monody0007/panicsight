@@ -125,8 +125,10 @@ on other platforms it exits 2 with a one-line error.
 Each complete line is written in one `write` followed by `flush`. Readers should
 ignore malformed or incomplete lines left by write errors and reopen the log
 after rotation. Rotation happens after a complete record (or on opening an
-already oversized log), so a file can exceed the limit by one record and the
-new active log can be empty.
+already oversized log), so a file normally exceeds the limit by at most one
+record and the new active log can be empty. While rotation itself keeps failing
+(for example an unwritable log directory), appends that still succeed pile up
+past the limit; the next successful rotation moves all of them into `PATH.1`.
 
 Only one watch may write a given log path: an exclusive nonblocking `flock` on
 `PATH.lock` lasts through rotation. A second writer exits 2 with
