@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 (2026-10-17)
+
+- Add load averages, logical CPU count, swap bytes, physical RAM and memory status level to check and schema-1 watch records; unavailable readings remain null.
+- Add configurable pressure sampling triggers, load and combined memory WARN rules, and per-category watch hysteresis. Stateless check uses entry thresholds.
+- Add asynchronous `watch --on-event PATH`: JSON stdin, one in-flight child and one pending event (latest replaces older pending events with stderr diagnostics), a 60-second timeout, and isolated failures. Pending events run as soon as the current hook finishes. Reap after timeout is limited to 10 seconds; if it also times out, stop waiting and disable further hooks to prevent overlapping children.
+
 ## 0.2.0 (2026-10-17)
 
 - `panicsight watch`: sample file/vnode headroom and the top per-process fd holders with a 900-second baseline and a 30-second elevated tier, using standard-library ctypes and macOS libproc.

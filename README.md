@@ -22,7 +22,7 @@ pipx install git+https://github.com/monody0007/panicsight
 
 ## Usage
 
-`panicsight --version` prints the installed version, for example `panicsight 0.2.0`.
+`panicsight --version` prints the installed version, for example `panicsight 0.3.0`.
 
 ### `panicsight analyze FILE [--json]`
 
@@ -58,9 +58,31 @@ free vnodes: 69.2% of kern.maxvnodes
 status: OK
 ```
 
+Host pressure is also collected by both `check` and `watch`:
+
+- `load_avg`: the three `vm.loadavg` readings (1/5/15 minutes); `ncpu` from `hw.logicalcpu`; `load1_per_core` and `load5_per_core` divide by that count.
+- `swap_used_bytes` and `swap_total_bytes` from `vm.swapusage` (binary K/M/G/T units); `memsize_bytes` from `hw.memsize`; `swap_used_pct_of_ram` uses physical RAM as its denominator, not total swap.
+- `memorystatus_level` from `kern.memorystatus_level` is recorded as reported. It is unreliable on its own and never independently causes a warning.
+
+Pressure WARN enters at **load5/CPU >= 3**, or **swap/RAM >= 25% AND memorystatus_level <= 40**. Swap alone does not warn: swapped-out pages can stay on disk after pressure has passed.
+`check` is stateless and uses these entry thresholds every time. `watch` retains each pressure category separately: load WARN clears only below **2**, and memory WARN clears at **level > 50 OR swap/RAM < 20%**. Values exactly on a recovery boundary retain WARN. File/vnode rules are unchanged. `recover` fires only after every warning category clears. Unknown values never trigger or retain pressure WARN; they are not evidence that the host is healthy.
+
+Both commands accept these pressure options. Watch copies their configured values into every record's `thresholds` (schema stays 1; new fields are additive):
+
+| CLI option | Default | Record threshold key |
+| --- | --- | --- |
+| `--load-elevated-per-core` | 1.5 | `load_elevated_per_core` |
+| `--swap-growth-bytes` | 2147483648 (2 GiB) | `swap_growth_bytes` |
+| `--load-warn-per-core` | 3 | `load_warn_per_core` |
+| `--swap-warn-pct-of-ram` | 25 | `swap_warn_pct_of_ram` |
+| `--memory-warn-level` | 40 | `memory_warn_level` |
+| `--load-recover-per-core` | 2 | `load_recover_per_core` |
+| `--swap-recover-pct-of-ram` | 20 | `swap_recover_pct_of_ram` |
+| `--memory-recover-level` | 50 | `memory_recover_level` |
+
 ### `panicsight watch`
 
-Continuously sample the same six sysctls as `check`, together with per-process
+Continuously sample the same host and file/vnode sysctls as `check`, together with per-process
 fd counts from macOS libproc. The first sample is immediate, and every sample
 attempts one record. Without `--log`, each record is one human-readable
 stdout line. With `--log`, append schema v1 JSONL, creating parent directories:
@@ -79,13 +101,16 @@ panicsight watch --count 3 --baseline-interval 1 --elevated-interval 1
 | `--top N` | `5` | Positive number of top fd holders to record. |
 | `--max-bytes N` | `5000000` | Rotate when the log exceeds N bytes, replacing `PATH.1`; retain exactly one backup. |
 | `--count N` | forever | Stop after N samples, including failed writes. |
+| `--on-event PATH` | disabled | Execute this program on warn/recover with record JSON on stdin. |
 
 Watch starts in **baseline** mode (15 minutes). A sample switches it to
 **elevated** mode (30 seconds) if any of these conditions fires:
 
 - File table use is **>= 20%** of `kern.maxfiles` (`file_table_pct>=20`).
 - Free vnodes are **<= 30%** of `kern.maxvnodes` (`free_vnode_pct<=30`).
-- `check` reports **WARN** (`status=WARN`): file table use >= 50% or free vnodes < 10%.
+- The sample reports **WARN** (`status=WARN`), including pressure warnings below.
+- Load 1 per logical CPU is **>= 1.5** (`load1_per_core>=1.5`).
+- Swap grows **>= 2 GiB** since the immediately previous sample (`swap_growth_bytes>=2.14748e+09`); a missing preceding reading breaks the comparison.
 - File table use rises **>= 5 percentage points** since the immediately previous
   sample (`growth>=5pp`). This is a percentage-point change, not a relative increase.
 
@@ -107,8 +132,10 @@ seconds precision. SIGTERM and Ctrl-C interrupt even a 900-second wait and exit 
 Example JSONL line (illustrative values):
 
 ```json
-{"schema":1,"ts":"2026-10-16T12:00:00-07:00","mode":"elevated","next_interval_s":30,"events":["escalate"],"triggers":["file_table_pct>=20"],"num_files":100000,"maxfiles":491520,"maxfilesperproc":245760,"num_vnodes":263168,"maxvnodes":263168,"free_vnodes":180000,"file_table_pct":20.345052083333336,"free_vnode_pct":68.39737354085604,"status":"OK","warnings":[],"thresholds":{"file_table_warn_pct":50.0,"free_vnode_warn_pct":10.0,"file_table_elevated_pct":20.0,"free_vnode_elevated_pct":30.0,"growth_pct_points":5.0},"top_fd":[{"pid":1234,"name":"Python","fds":3003}]}
+{"schema":1,"ts":"2026-10-16T12:00:00-07:00","mode":"elevated","next_interval_s":30,"events":["escalate"],"triggers":["file_table_pct>=20"],"num_files":100000,"maxfiles":491520,"maxfilesperproc":245760,"num_vnodes":263168,"maxvnodes":263168,"free_vnodes":180000,"file_table_pct":20.345052083333336,"free_vnode_pct":68.39737354085604,"status":"OK","warnings":[],"thresholds":{"file_table_warn_pct":50.0,"free_vnode_warn_pct":10.0,"file_table_elevated_pct":20.0,"free_vnode_elevated_pct":30.0,"growth_pct_points":5.0,"load_elevated_per_core":1.5,"swap_growth_bytes":2147483648,"load_warn_per_core":3,"swap_warn_pct_of_ram":25,"memory_warn_level":40,"load_recover_per_core":2,"swap_recover_pct_of_ram":20,"memory_recover_level":50},"top_fd":[{"pid":1234,"name":"Python","fds":3003}],"load_avg":[18,18,18],"ncpu":18,"load1_per_core":1,"load5_per_core":1,"swap_used_bytes":0,"swap_total_bytes":1073741824,"memsize_bytes":137438953472,"swap_used_pct_of_ram":0,"memorystatus_level":90}
 ```
+
+`--on-event /absolute/path/to/program` runs the path as one argv element, without a shell. The entire warn/recover record is JSON on stdin. A worker thread starts one child in a separate session and feeds stdin without blocking sampling or log writes. At most one hook is in flight and one event is pending. New events replace the pending event with the latest snapshot, with stderr diagnostics; when the current hook finishes, the latest pending event runs immediately. A child exceeding 60 seconds is killed, then reaped with a further 10-second limit. If reap also times out, the watcher logs the failure, abandons waiting and disables further hooks so a second child cannot overlap the unreaped one. Other execution failures only go to stderr, and pending events still run. Hook stdout is discarded and stderr is inherited. Shutdown drains the in-flight hook and the latest pending event, with those same per-child limits. Hooks should exit promptly and avoid spawning descendants; the timeout applies to the direct child. Hooks run with the watcher's permissions, so use a trusted executable. Replaced/failed events are not retried.
 
 Only pid, process name (basename) and fd count are recorded for each holder;
 paths, argv and cwd are never collected. Counts come from the actual fd list
