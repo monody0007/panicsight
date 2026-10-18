@@ -42,7 +42,7 @@ class VersionCliTest(CliBase):
                 cli.main(["--version"])
         self.assertEqual(exc.exception.code, 0)
         self.assertEqual(stdout.getvalue(), "panicsight %s\n" % __version__)
-        self.assertEqual(__version__, "0.2.0")
+        self.assertEqual(__version__, "0.3.0")
         self.assertEqual(stderr.getvalue(), "")
 
 

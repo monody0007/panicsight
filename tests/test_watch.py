@@ -181,14 +181,14 @@ def test_exact_schema_and_shared_thresholds(tmp_path, monkeypatch):
     monkeypatch.setattr(check, "DEESCALATE_AFTER_SAMPLES", 2)
     _, rows, _, _ = run_samples(tmp_path, [value(61, 5), LOW, LOW])
     row = rows[0]
-    assert set(row) == KEYS
+    assert set(row) == KEYS | set(check.PRESSURE_FIELDS)
     assert row["schema"] == 1
     assert row["status"] == "OK"
     assert row["warnings"] == []
     assert row["triggers"] == ["file_table_pct>=60", "free_vnode_pct<=6"]
     assert row["thresholds"] == {"file_table_warn_pct": 80.0, "free_vnode_warn_pct": 5.0,
                                  "file_table_elevated_pct": 60.0, "free_vnode_elevated_pct": 6.0,
-                                 "growth_pct_points": 8.0}
+                                 "growth_pct_points": 8.0, **check.PRESSURE_DEFAULTS}
     assert rows[2]["events"] == ["deescalate"]
     assert set(row["top_fd"][0]) == {"pid", "name", "fds"}
     assert datetime.fromisoformat(row["ts"]).utcoffset() is not None
@@ -436,7 +436,7 @@ def test_rotation_failure_reopens_and_recovers_next_record(tmp_path, monkeypatch
     assert path.read_text() == ""
     rows = [json.loads(line) for line in Path(str(path) + ".1").read_text().splitlines()]
     assert len(rows) == 3
-    assert all(set(row) == KEYS for row in rows)
+    assert all(set(row) == KEYS | set(check.PRESSURE_FIELDS) for row in rows)
     assert capsys.readouterr().err.splitlines() == [
         "error: log write failed (PermissionError); retrying with next sample",
         "log write recovered"]
@@ -670,11 +670,11 @@ def test_watch_cli_defaults_and_options(monkeypatch):
     monkeypatch.setattr(watch, "run_watch", run)
     assert cli.main(["watch"]) == 0
     assert run.call_args.kwargs == {"baseline_interval": 900, "elevated_interval": 30,
-                                  "log": None, "top": 5, "max_bytes": 5_000_000, "count": None}
+                                  "log": None, "top": 5, "max_bytes": 5_000_000, "count": None, "on_event": None, "thresholds": check.PRESSURE_DEFAULTS}
     assert cli.main(["watch", "--baseline-interval", "5", "--elevated-interval", "1",
                      "--log", "log.jsonl", "--top", "2", "--max-bytes", "1234", "--count", "3"]) == 0
     assert run.call_args.kwargs == {"baseline_interval": 5, "elevated_interval": 1,
-                                  "log": "log.jsonl", "top": 2, "max_bytes": 1234, "count": 3}
+                                  "log": "log.jsonl", "top": 2, "max_bytes": 1234, "count": 3, "on_event": None, "thresholds": check.PRESSURE_DEFAULTS}
 
 
 @pytest.mark.parametrize("option,value", [
