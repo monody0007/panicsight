@@ -8,6 +8,7 @@ from pathlib import Path
 import platform
 import signal
 import sys
+import subprocess
 import threading
 
 from panicsight import check
@@ -66,10 +67,10 @@ def enumerate_fds():
     return holders
 
 
-def collect_sample(runner, fd_enumerator, top, now):
+def collect_sample(runner, fd_enumerator, top, now, thresholds=None):
     """Keep the headroom values and fd ranking from the same sampling pass."""
     timestamp = now().astimezone().isoformat(timespec="seconds")
-    evaluation = check.evaluate(check.collect_values(runner))
+    evaluation = check.evaluate(check.collect_values(runner), thresholds)
     holders = sorted(fd_enumerator(), key=lambda item: (-item["fds"], item["pid"]))
     return {"ts": timestamp, **evaluation,
             "top_fd": [{"pid": item["pid"],
@@ -80,7 +81,10 @@ def collect_sample(runner, fd_enumerator, top, now):
 class TierState:
     """Apply transitions using only this sample and the immediately previous one."""
 
-    def __init__(self):
+    def __init__(self, thresholds=None):
+        self.thresholds = dict(check.PRESSURE_DEFAULTS if thresholds is None else thresholds)
+        self.pressure_active = set()
+        self.previous_swap = None
         self.mode = "baseline"
         self.previous_file_pct = None
         self.previous_status = "OK"
@@ -89,6 +93,18 @@ class TierState:
     def update(self, sample):
         file_pct, free_pct = sample["file_table_pct"], sample["free_vnode_pct"]
         triggers, events = [], []
+        # Re-evaluate only pressure reasons with hysteresis, leaving file/vnode reasons untouched.
+        base = [w for w in sample["warnings"] if not w.startswith(("load5_per_core=", "swap_used_pct_of_ram="))]
+        pressure, self.pressure_active = check.pressure_warnings(sample, self.thresholds, self.pressure_active)
+        sample["warnings"] = base + pressure
+        sample["status"] = "WARN" if sample["warnings"] else "OK"
+        load, swap = sample.get("load1_per_core"), sample.get("swap_used_bytes")
+        if load is not None and load >= self.thresholds["load_elevated_per_core"]:
+            triggers.append("load1_per_core>=%g" % self.thresholds["load_elevated_per_core"])
+        if (swap is not None and self.previous_swap is not None and
+                swap - self.previous_swap >= self.thresholds["swap_growth_bytes"]):
+            triggers.append("swap_growth_bytes>=%g" % self.thresholds["swap_growth_bytes"])
+        self.previous_swap = swap
         if file_pct is not None and file_pct >= check.ELEVATED_FILE_TABLE_PCT:
             triggers.append("file_table_pct>=%g" % check.ELEVATED_FILE_TABLE_PCT)
         if free_pct is not None and free_pct <= check.ELEVATED_FREE_VNODE_PCT:
@@ -117,18 +133,20 @@ class TierState:
         return events, triggers
 
 
-def make_record(sample, mode, next_interval, events, triggers):
+def make_record(sample, mode, next_interval, events, triggers, thresholds=None):
     return {"schema": 1, "ts": sample["ts"], "mode": mode,
             "next_interval_s": next_interval, "events": events, "triggers": triggers,
             **{key: sample[key] for key in (
                 "num_files", "maxfiles", "maxfilesperproc", "num_vnodes",
                 "maxvnodes", "free_vnodes", "file_table_pct", "free_vnode_pct",
                 "status", "warnings")},
+            **{key: sample.get(key) for key in check.PRESSURE_FIELDS},
             "thresholds": {"file_table_warn_pct": check.FILE_TABLE_WARN_PCT,
                            "free_vnode_warn_pct": check.FREE_VNODE_WARN_PCT,
                            "file_table_elevated_pct": check.ELEVATED_FILE_TABLE_PCT,
                            "free_vnode_elevated_pct": check.ELEVATED_FREE_VNODE_PCT,
-                           "growth_pct_points": check.GROWTH_PCT_POINTS},
+                           "growth_pct_points": check.GROWTH_PCT_POINTS,
+                           **(check.PRESSURE_DEFAULTS if thresholds is None else thresholds)},
             "top_fd": sample["top_fd"]}
 
 
@@ -217,9 +235,83 @@ class RecordWriter:
                 self.lock_file.close()
 
 
+class EventHook:
+    """One child and one replaceable pending event, independent of sampling.
+
+    Only single-threaded calls to submit() and close() are supported: both must
+    be called from the same caller thread, as run_watch does.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.thread = None
+        self.lock = threading.Lock()
+        self.running = False
+        self.pending = None
+        self.abandoned = False
+
+    def submit(self, record):
+        if not self.path or not {"warn", "recover"}.intersection(record["events"]):
+            return
+        # Snapshot now: callers may reuse/mutate the record while a hook runs.
+        payload = (json.dumps(record) + "\n").encode()
+        with self.lock:
+            if self.abandoned:
+                print("error: event hook disabled after unreaped child; skipping event", file=sys.stderr)
+                return
+            if self.running:
+                action = "replacing pending event" if self.pending is not None else "queued latest event"
+                self.pending = payload
+                print("event hook still running; " + action, file=sys.stderr)
+                return
+            self.running = True
+            self.thread = threading.Thread(target=self._drain, args=(payload,))
+        self.thread.start()
+
+    def _drain(self, payload):
+        while True:
+            completed = self._execute(payload)
+            with self.lock:
+                if not completed:
+                    # A killed child may still exist. Do not start a second one.
+                    self.abandoned = True
+                    self.pending = None
+                if self.pending is None:
+                    self.running = False
+                    return
+                payload, self.pending = self.pending, None
+
+    def _execute(self, payload):
+        try:
+            child = subprocess.Popen([str(self.path)], stdin=subprocess.PIPE,
+                                     stdout=subprocess.DEVNULL, start_new_session=True)
+            try:
+                child.communicate(payload, timeout=60)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                print("error: event hook timed out after 60 seconds; killed child", file=sys.stderr)
+                try:
+                    child.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    print("error: event hook reap timed out after 10 seconds; abandoning wait and disabling hooks",
+                          file=sys.stderr)
+                    return False
+                return True
+            if child.returncode:
+                print("error: event hook exited %s" % child.returncode, file=sys.stderr)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("error: event hook failed (%s)" % exc.__class__.__name__, file=sys.stderr)
+        return True
+
+    def close(self):
+        # Drain the latest pending event too; each child has bounded waits.
+        if self.thread is not None:
+            self.thread.join()
+
+
 def run_watch(baseline_interval=900, elevated_interval=30, log=None, top=5,
               max_bytes=5_000_000, count=None, *, runner=None, fd_enumerator=None,
-              wait=None, now=None, stop_event=None, stream=None):
+              wait=None, now=None, stop_event=None, stream=None, thresholds=None, on_event=None):
     """Emit one record immediately, then wait at the tier selected by each sample.
 
     Clock, wait, sysctls and fd enumeration can all be replaced in tests.
@@ -239,7 +331,8 @@ def run_watch(baseline_interval=900, elevated_interval=30, log=None, top=5,
     def stop(signum, frame):
         stop_event.set()
 
-    state = TierState()
+    state = TierState(thresholds)
+    hook = EventHook(on_event)
     sampled = 0
     write_failed = False
     try:
@@ -248,12 +341,13 @@ def run_watch(baseline_interval=900, elevated_interval=30, log=None, top=5,
         with RecordWriter(log, max_bytes, stream) as writer:
             try:
                 while not stop_event.is_set():
-                    sample = collect_sample(runner, fd_enumerator, top, now)
+                    sample = collect_sample(runner, fd_enumerator, top, now, thresholds)
                     events, triggers = state.update(sample)
                     interval = (elevated_interval if state.mode == "elevated"
                                 else baseline_interval)
+                    record = make_record(sample, state.mode, interval, events, triggers, thresholds)
                     try:
-                        writer.write(make_record(sample, state.mode, interval, events, triggers))
+                        writer.write(record)
                     except OSError as exc:
                         if not write_failed:
                             print("error: log write failed (%s); retrying with next sample"
@@ -263,6 +357,7 @@ def run_watch(baseline_interval=900, elevated_interval=30, log=None, top=5,
                         if write_failed:
                             print("log write recovered", file=sys.stderr)
                         write_failed = False
+                    hook.submit(record)
                     sampled += 1
                     if count is not None and sampled >= count:
                         break
@@ -272,5 +367,6 @@ def run_watch(baseline_interval=900, elevated_interval=30, log=None, top=5,
                 pass
         return 0
     finally:
+        hook.close()
         for signum, handler in handlers.items():
             signal.signal(signum, handler)

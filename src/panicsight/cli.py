@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import sys
 
 from panicsight import __version__
@@ -12,6 +13,13 @@ def _positive_int(value):
     number = int(value)
     if number < 1:
         raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def _nonnegative(value):
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("must be a finite nonnegative number")
     return number
 
 
@@ -44,6 +52,11 @@ def build_parser():
                        help="rotate the log above N bytes, keeping PATH.1 (default 5000000)")
     watch.add_argument("--count", type=_positive_int, metavar="N",
                        help="stop after N samples, including failed writes (default forever)")
+    watch.add_argument("--on-event", metavar="PATH", help="execute PATH asynchronously on warn/recover; JSON on stdin, 60 s timeout")
+    for command in (check, watch):
+        for key, default in check_module.PRESSURE_DEFAULTS.items():
+            command.add_argument("--" + key.replace("_", "-"), type=_nonnegative, default=default,
+                                 help="pressure threshold (default %g)" % default)
     return parser
 
 
@@ -69,6 +82,7 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "analyze":
         return _cmd_analyze(args.json, args.file)
+    thresholds = {key: getattr(args, key) for key in check_module.PRESSURE_DEFAULTS} if args.command in ("watch", "check") else None
     if args.command == "watch":
         if args.elevated_interval > args.baseline_interval:
             parser.error("--elevated-interval must be <= --baseline-interval")
@@ -76,7 +90,8 @@ def main(argv=None):
             return watch_module.run_watch(
                 baseline_interval=args.baseline_interval,
                 elevated_interval=args.elevated_interval, log=args.log,
-                top=args.top, max_bytes=args.max_bytes, count=args.count)
+                top=args.top, max_bytes=args.max_bytes, count=args.count,
+                on_event=args.on_event, thresholds=thresholds)
         except watch_module.LogLockedError as exc:
             print("error: %s" % exc, file=sys.stderr)
             return 2
@@ -84,7 +99,7 @@ def main(argv=None):
             print("error: cannot write watch output (%s)" % exc.__class__.__name__,
                   file=sys.stderr)
             return 2
-    return _cmd_check(args.json)
+    return _cmd_check(args.json, thresholds)
 
 
 def _cmd_analyze(as_json, path):
@@ -100,8 +115,8 @@ def _cmd_analyze(as_json, path):
     return 0
 
 
-def _cmd_check(as_json):
-    code, text, evaluation = check_module.run_check()
+def _cmd_check(as_json, thresholds=None):
+    code, text, evaluation = check_module.run_check(thresholds=thresholds)
     if code != 0:
         print("error: %s" % text, file=sys.stderr)
         return code
