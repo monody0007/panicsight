@@ -126,3 +126,15 @@ def test_cli_threshold_options_and_record(tmp_path):
     assert all(record['thresholds'][k] == v+1 for k, v in check.PRESSURE_DEFAULTS.items())
     assert all(k in record for k in check.PRESSURE_FIELDS)
     assert check.evaluate(values(3), dict(check.PRESSURE_DEFAULTS, load_warn_per_core=4))['status'] == 'OK'
+
+
+def test_warning_prefix_names_its_category():
+    """Consumers classify warnings by prefix; keep the field name first."""
+    from panicsight.check import pressure_warnings
+    sample = {"load5_per_core": 5.0, "swap_used_pct_of_ram": 30.0, "memorystatus_level": 20}
+    warnings, current = pressure_warnings(sample)
+    assert current == {"load", "memory"}
+    assert [w.split("=", 1)[0] for w in warnings] == ["load5_per_core", "swap_used_pct_of_ram"]
+    held, _ = pressure_warnings({"load5_per_core": 0.1, "swap_used_pct_of_ram": 22.0,
+                                 "memorystatus_level": 45}, active={"memory"})
+    assert len(held) == 1 and held[0].startswith("swap_used_pct_of_ram=")
