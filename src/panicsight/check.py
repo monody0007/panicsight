@@ -88,7 +88,11 @@ def pressure_values(values):
 
 
 def pressure_warnings(sample, thresholds=None, active=None):
-    """Unknown readings never warn; watch supplies the preceding category state."""
+    """Unknown readings never warn; watch supplies the preceding category state.
+
+    Contract: each warning starts with the field that triggered it (`load5_per_core=` or
+    `swap_used_pct_of_ram=`), so log consumers can classify warnings by prefix.
+    """
     t = PRESSURE_DEFAULTS if thresholds is None else thresholds
     prior = active or set()
     warnings, current = [], set()
